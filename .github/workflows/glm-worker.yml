@@ -5,9 +5,12 @@
 # 指示は Actions の手動実行で渡し、結果は glm/run-<番号> の枝（ブランチ）に置く。
 # main には書き込まない。サイトは main への push で公開されるので、取り込むかどうかは人が決める。
 #
-# GLM に渡す道具は、ファイルの読み書きと検索だけ。コマンドの実行とネットからの取得は渡さない。
-# 鍵を外へ持ち出す道筋をなくすため。テストの実行などが要る作業には向かないので、
-# 道具を足すときは、何を許すかを先に決める。
+# GLM は確認なしで何でも実行できる（コマンド、ネットからの取得、sudo も含む）。
+# そのため仕事を2つに分けている。
+#   work    … GLM が作業する。GitHub の鍵は読むだけの権限にして、書き込めないようにする。
+#   publish … 別の機械で、work が作った変更を受け取って枝に置く。ここでは GLM は動かない。
+# .github/ の変更は捨てる。GLM が自分の動かし方を書き換えないようにするため。
+# GLM からは HF_TOKEN が見える。推論の呼び出しだけを許可した鍵にして、漏れても被害が料金で済むようにする。
 #
 # 使う前に一度だけ:
 #   1. Settings → Secrets and variables → Actions に HF_TOKEN を登録する。
@@ -43,17 +46,20 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   work:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.glm.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.base }}
-          # GLM に GitHub への書き込み権を渡さない。push は最後の手順だけが行う。
           persist-credentials: false
 
       - uses: actions/setup-node@v6
@@ -71,9 +77,9 @@ jobs:
           INSTRUCTION: ${{ inputs.instruction }}
           MAX_TURNS: ${{ inputs.max_turns }}
           RULES: |
-            あなたは GitHub Actions の使い捨ての機械で動いている。
-            - 使える道具はファイルの読み書きと検索だけ。コマンドの実行やネットからの取得はできない。
+            あなたは GitHub Actions の使い捨ての機械で動いている。コマンドの実行もネットからの取得も、確認なしでできる。
             - 指示された作業だけを行い、関係のないファイルは変えない。
+            - push はできない。変更は後の手順が枝に置く。.github/ の変更は採用されない。
             - 最後に、変えたファイルとその理由を日本語で短く報告する。確かめられなかった点はそう書く。
         run: |
           set -euo pipefail
@@ -82,7 +88,10 @@ jobs:
             echo "HF_TOKEN が登録されていない。Settings → Secrets and variables → Actions で登録する。" >&2
             exit 1
           fi
-          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          BASE_SHA="$(git rev-parse HEAD)"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          OUT="$RUNNER_TEMP/glm"
+          mkdir -p "$OUT"
 
           # 文脈の長さは提供元の公開値に合わせる。
           # 渡さないと Claude Code は知らないモデルを20万トークン扱いにして、早めに要約を始める。
@@ -112,19 +121,43 @@ jobs:
             echo "文脈の長さ: $CONTEXT"
           fi
 
-          # 道具はファイルの読み書きと検索だけにする。編集はこの写しの中だけ自動で通し、
-          # それ以外で確認が要る操作はすべて断る（人が答えられないため）。
-          # 途中で止まっても、そこまでの変更は次の手順で枝に残す。
+          # 確認なしで動かす。途中で止まっても、そこまでの変更は publish が枝に残す。
           status=0
           claude -p "$INSTRUCTION" \
             --model "$MODEL" \
             --max-turns "$MAX_TURNS" \
-            --tools "Read,Glob,Grep,Edit,Write" \
-            --permission-mode acceptEdits \
-            --permission-prompts none \
+            --dangerously-skip-permissions \
             --append-system-prompt "$RULES" \
-            > "$RUNNER_TEMP/report.md" || status=$?
-          echo "status=$status" >> "$GITHUB_OUTPUT"
+            > "$OUT/report.md" || status=$?
+          echo "$status" > "$OUT/status"
+
+          # GLM が commit していても、元の commit からの差分としてまとめて渡す。
+          git add -A
+          git diff --cached --binary "$BASE_SHA" -- . ':(exclude).github' > "$OUT/changes.patch"
+          git diff --cached --name-only "$BASE_SHA" -- .github > "$OUT/dropped.txt"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: glm-result
+          path: ${{ runner.temp }}/glm
+          retention-days: 7
+
+  publish:
+    needs: work
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.work.outputs.base_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: glm-result
+          path: ${{ runner.temp }}/glm
 
       - name: 結果を枝に置く
         env:
@@ -132,50 +165,56 @@ jobs:
           INSTRUCTION: ${{ inputs.instruction }}
           BASE: ${{ inputs.base }}
           MODEL: ${{ inputs.model }}
-          BASE_SHA: ${{ steps.glm.outputs.base_sha }}
-          STATUS: ${{ steps.glm.outputs.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           export LC_ALL=C.UTF-8
-          REPORT="$(cat "$RUNNER_TEMP/report.md" 2>/dev/null || true)"
-          NOTE=""
+          DIR="$RUNNER_TEMP/glm"
+          REPORT="$(cat "$DIR/report.md" 2>/dev/null || true)"
+          STATUS="$(cat "$DIR/status" 2>/dev/null || echo "?")"
+          DROPPED="$(tr '\n' ' ' < "$DIR/dropped.txt" 2>/dev/null || true)"
+          NOTES=""
           if [ "$STATUS" != "0" ]; then
-            NOTE="GLM の実行は途中で止まった（終了コード $STATUS）。"
+            NOTES+="GLM の実行は途中で止まった（終了コード $STATUS）。"$'\n'
+          fi
+          if [ -n "${DROPPED// /}" ]; then
+            NOTES+=".github/ の変更は捨てた: $DROPPED"$'\n'
           fi
 
           {
             echo "## 指示"; echo; echo "$INSTRUCTION"; echo
             echo "## GLM の報告"; echo; echo "$REPORT"; echo
-            if [ -n "$NOTE" ]; then echo "$NOTE"; fi
+            if [ -n "$NOTES" ]; then echo "$NOTES"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          git config user.name "glm-worker"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if ! git diff --cached --quiet; then
-            FIRST_LINE="${INSTRUCTION%%$'\n'*}"
-            {
-              echo "GLM作業（${GITHUB_RUN_NUMBER}）: ${FIRST_LINE:0:40}"
-              echo
-              echo "■ 指示"
-              echo "$INSTRUCTION"
-              echo
-              echo "■ GLM の報告"
-              echo "${REPORT:0:8000}"
-              echo
-              echo "■ 実行"
-              echo "モデル: $MODEL / 元の枝: $BASE"
-              if [ -n "$NOTE" ]; then echo "$NOTE"; fi
-              echo "$RUN_URL"
-            } > "$RUNNER_TEMP/message.txt"
-            git commit -q -F "$RUNNER_TEMP/message.txt"
+          # .github/ は work 側でも外しているが、ここでも念のため捨てる。
+          if [ -s "$DIR/changes.patch" ]; then
+            git apply --index --exclude='.github/*' "$DIR/changes.patch"
           fi
-
-          if [ "$(git rev-parse HEAD)" = "$BASE_SHA" ]; then
+          if git diff --cached --quiet; then
             echo "ファイルの変更なし。枝は作らない。" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
+          git config user.name "glm-worker"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          FIRST_LINE="${INSTRUCTION%%$'\n'*}"
+          {
+            echo "GLM作業（${GITHUB_RUN_NUMBER}）: ${FIRST_LINE:0:40}"
+            echo
+            echo "■ 指示"
+            echo "$INSTRUCTION"
+            echo
+            echo "■ GLM の報告"
+            echo "${REPORT:0:8000}"
+            echo
+            echo "■ 実行"
+            echo "モデル: $MODEL / 元の枝: $BASE"
+            if [ -n "$NOTES" ]; then printf '%s' "$NOTES"; fi
+            echo "$RUN_URL"
+          } > "$RUNNER_TEMP/message.txt"
+          git commit -q -F "$RUNNER_TEMP/message.txt"
+
           BRANCH="glm/run-${GITHUB_RUN_NUMBER}"
           git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
           echo "結果の枝: \`${BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"

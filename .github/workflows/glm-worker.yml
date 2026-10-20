@@ -1,0 +1,181 @@
+# GLM 作業係
+#
+# GitHub Actions の使い捨ての機械で、GLM（Z.ai のモデル）を頭にした Claude Code を動かす。
+# Hugging Face の窓口（Inference Providers）を通して呼ぶので、料金は Hugging Face 側にかかる。
+# 指示は Actions の手動実行で渡し、結果は glm/run-<番号> の枝（ブランチ）に置く。
+# main には書き込まない。サイトは main への push で公開されるので、取り込むかどうかは人が決める。
+#
+# GLM に渡す道具は、ファイルの読み書きと検索だけ。コマンドの実行とネットからの取得は渡さない。
+# 鍵を外へ持ち出す道筋をなくすため。テストの実行などが要る作業には向かないので、
+# 道具を足すときは、何を許すかを先に決める。
+#
+# 使う前に一度だけ:
+#   1. Settings → Secrets and variables → Actions に HF_TOKEN を登録する。
+#      Hugging Face の鍵で、「Make calls to Inference Providers」だけを許可したもの。
+#   2. このファイルを main に入れる。手動実行の入口は main にあるファイルからしか作られない。
+#
+# このリポジトリは公開されているので、実行記録（指示と GLM の報告）は誰でも読める。
+# 顧客名・個人情報・合言葉を含む指示は出さない。
+
+name: GLM 作業係
+
+on:
+  workflow_dispatch:
+    inputs:
+      instruction:
+        description: GLM への指示
+        required: true
+        type: string
+      base:
+        description: 作業の元にする枝（前回の続きなら glm/run-<番号>）
+        required: false
+        default: main
+        type: string
+      model:
+        description: モデル。末尾の :zai-org は提供元の固定で、外すと速い提供元へ自動で振り分ける
+        required: false
+        default: zai-org/GLM-5.3:zai-org
+        type: string
+      max_turns:
+        description: やり取りの回数の上限（料金の歯止め）
+        required: false
+        default: "60"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.base }}
+          # GLM に GitHub への書き込み権を渡さない。push は最後の手順だけが行う。
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Claude Code を入れる
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: GLM に作業させる
+        id: glm
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODEL: ${{ inputs.model }}
+          INSTRUCTION: ${{ inputs.instruction }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+          RULES: |
+            あなたは GitHub Actions の使い捨ての機械で動いている。
+            - 使える道具はファイルの読み書きと検索だけ。コマンドの実行やネットからの取得はできない。
+            - 指示された作業だけを行い、関係のないファイルは変えない。
+            - 最後に、変えたファイルとその理由を日本語で短く報告する。確かめられなかった点はそう書く。
+        run: |
+          set -euo pipefail
+          export LC_ALL=C.UTF-8
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "HF_TOKEN が登録されていない。Settings → Secrets and variables → Actions で登録する。" >&2
+            exit 1
+          fi
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # 文脈の長さは提供元の公開値に合わせる。
+          # 渡さないと Claude Code は知らないモデルを20万トークン扱いにして、早めに要約を始める。
+          BASE_MODEL="${MODEL%%:*}"
+          PROVIDER=""
+          case "$MODEL" in *:*) PROVIDER="${MODEL#*:}" ;; esac
+          case "$PROVIDER" in fastest|cheapest|preferred) PROVIDER="" ;; esac
+          CONTEXT="$(curl -fsS https://router.huggingface.co/v1/models \
+              -H "Authorization: Bearer $HF_TOKEN" \
+            | jq -r --arg m "$BASE_MODEL" --arg p "$PROVIDER" \
+              '[.data[] | select(.id == $m) | .providers[]
+                | select($p == "" or .provider == $p) | .context_length // empty] | min // empty' \
+            || true)"
+
+          export ANTHROPIC_BASE_URL="https://router.huggingface.co"
+          export ANTHROPIC_AUTH_TOKEN="$HF_TOKEN"
+          export ANTHROPIC_API_KEY="$HF_TOKEN"
+          export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+          export ANTHROPIC_DEFAULT_FABLE_MODEL="$MODEL"
+          export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+          # Anthropic への利用状況の報告と自動更新を止める。話す相手は Hugging Face だけ。
+          export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          if [[ "$CONTEXT" =~ ^[0-9]+$ ]] && [ "$CONTEXT" -gt 0 ]; then
+            export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CONTEXT"
+            echo "文脈の長さ: $CONTEXT"
+          fi
+
+          # 道具はファイルの読み書きと検索だけにする。編集はこの写しの中だけ自動で通し、
+          # それ以外で確認が要る操作はすべて断る（人が答えられないため）。
+          # 途中で止まっても、そこまでの変更は次の手順で枝に残す。
+          status=0
+          claude -p "$INSTRUCTION" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --tools "Read,Glob,Grep,Edit,Write" \
+            --permission-mode acceptEdits \
+            --permission-prompts none \
+            --append-system-prompt "$RULES" \
+            > "$RUNNER_TEMP/report.md" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: 結果を枝に置く
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTRUCTION: ${{ inputs.instruction }}
+          BASE: ${{ inputs.base }}
+          MODEL: ${{ inputs.model }}
+          BASE_SHA: ${{ steps.glm.outputs.base_sha }}
+          STATUS: ${{ steps.glm.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C.UTF-8
+          REPORT="$(cat "$RUNNER_TEMP/report.md" 2>/dev/null || true)"
+          NOTE=""
+          if [ "$STATUS" != "0" ]; then
+            NOTE="GLM の実行は途中で止まった（終了コード $STATUS）。"
+          fi
+
+          {
+            echo "## 指示"; echo; echo "$INSTRUCTION"; echo
+            echo "## GLM の報告"; echo; echo "$REPORT"; echo
+            if [ -n "$NOTE" ]; then echo "$NOTE"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git config user.name "glm-worker"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            FIRST_LINE="${INSTRUCTION%%$'\n'*}"
+            {
+              echo "GLM作業（${GITHUB_RUN_NUMBER}）: ${FIRST_LINE:0:40}"
+              echo
+              echo "■ 指示"
+              echo "$INSTRUCTION"
+              echo
+              echo "■ GLM の報告"
+              echo "${REPORT:0:8000}"
+              echo
+              echo "■ 実行"
+              echo "モデル: $MODEL / 元の枝: $BASE"
+              if [ -n "$NOTE" ]; then echo "$NOTE"; fi
+              echo "$RUN_URL"
+            } > "$RUNNER_TEMP/message.txt"
+            git commit -q -F "$RUNNER_TEMP/message.txt"
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$BASE_SHA" ]; then
+            echo "ファイルの変更なし。枝は作らない。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BRANCH="glm/run-${GITHUB_RUN_NUMBER}"
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          echo "結果の枝: \`${BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"

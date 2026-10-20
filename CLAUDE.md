@@ -21,6 +21,7 @@ wingconsulting.org の公開サイト。**ビルド工程を持たない静的 H
 | `staypath/` | 別リポジトリでビルドした SPA の成果物（後述） |
 | `netlify/edge-functions/` | StayPath の入口認証 |
 | `images/og/` | 記事ごとの OG 画像。1200x630、ファイル名は記事スラッグと一致 |
+| `.github/workflows/` | GLM 作業係（後述） |
 
 `_faqs.json` / `_svcs.json` はどの HTML からも参照されていない。触る前に用途を確かめること。
 
@@ -28,6 +29,16 @@ wingconsulting.org の公開サイト。**ビルド工程を持たない静的 H
 
 Netlify。`main` への push で公開される。ビルドコマンドは無い。
 ヘッダー・リダイレクト・Edge Function の割り当ては `netlify.toml` に集約されている。
+
+## GLM 作業係（`.github/workflows/glm-worker.yml`）
+
+Actions の手動実行で、Hugging Face 経由の GLM（Z.ai のモデル）を頭にした Claude Code を動かす。
+結果は `glm/run-<番号>` の枝に置き、**main には書き込まない**。取り込む前に中身を必ず確かめる。
+
+- 前提はリポジトリの Secrets にある `HF_TOKEN`（Inference Providers の呼び出しだけを許可した鍵）。料金は Hugging Face 側にかかる
+- GLM に渡す道具はファイルの読み書きと検索だけ。コマンドの実行とネットからの取得は渡していない
+- 実行記録（指示と GLM の報告）は誰でも読める。顧客名・個人情報を含む指示は出さない
+- 前回の続きをさせるときは、元の枝に `glm/run-<番号>` を指定する
 
 ## StayPath（/staypath/）
 

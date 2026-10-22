@@ -39,7 +39,7 @@
 
 ## ニュース
 - [ニュース一覧](https://wingconsulting.org/news/): 関税・規制・技術の重要な更新を日付順に掲載
-- [日本企業への関税影響｜2026年10月20日時点の確認事項](https://wingconsulting.org/news/japan-tariff-impact): 2026-10-20（米東部時間）更新。米国向け牛肉の追加枠第3期と石英系人工石の第2四半期枠の受付案内を反映。対象品目・原産地、制度上の期間と受付日、枠内外の税負担を整理しています。
+- [日本企業への関税影響｜2026年10月21日時点の確認事項](https://wingconsulting.org/news/japan-tariff-impact): 2026-10-21（米東部時間）更新。米国向けポリエステル短繊維のTIB数量枠と、日EU食品3区分の11月再割当を反映。対象条件・数量上限・申請期間を整理しています。
 - [関税ニュースのRSS](https://wingconsulting.org/tariff-news.xml): 重要な変更を確認できたときに配信
 
 ## Claude認定の取得記録と学習
